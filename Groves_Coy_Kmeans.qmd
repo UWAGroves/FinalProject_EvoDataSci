@@ -1,0 +1,572 @@
+---
+title: "Groves_Coy_Kmeans"
+author: "AGroves"
+ormat: 
+  html:
+    self-contained: true
+editor: visual
+---
+
+## Load Packages
+
+```{r}
+
+#install.packages("rmarkdown")
+#install.packages("adehabitatHR")
+#install.packages("plyr")
+#install.packages("dplyr")
+#install.packages("terra")
+#install.packages("sf")
+#install.packages("ggplot2")
+#install.packages("ggpubr")
+#install.packages("spatstat")
+#install.packages("cluster")
+#install.packages("purrr")
+#install.packages("lubridate")
+#install.packages("raster")
+
+library(adehabitatHR)
+library(plyr)
+library(dplyr)
+library(terra)
+library(sf)
+library(ggplot2)
+library(ggpubr)
+library(spatstat)
+library(cluster) 
+library(purrr) 
+library(lubridate) 
+library(raster)
+```
+
+## Import Data
+
+```{r}
+
+# Automatically set working directory to the script's location
+
+if (requireNamespace("rstudioapi", quietly = TRUE)) {
+  current_path <- rstudioapi::getActiveDocumentContext()$path
+  if (nzchar(current_path)) {
+    setwd(dirname(current_path))
+  }
+}
+
+
+#Import sample list
+load("kmeans_Master.RData")
+head(master.fdeploy.list[[1]])
+```
+
+### Data Formatting
+
+```{r}
+# Convert to single dataframe
+
+coy.df <- do.call(rbind, master.fdeploy.list)
+
+# Format date column as POSIXct
+
+coy.df$rdate.cent <- as.POSIXct(coy.df$rdate.cent, format = "%Y-%m-%d %H:%M:%S", tz = "America/Chicago")
+
+# Convert data frame to an sf object
+
+coy.df <- coy.df[!(is.na(coy.df$Lat) | is.na(coy.df$Long)), ]
+temp.utm1 <- st_as_sf(coy.df, coords = c("Longitude", "Latitude"), crs = 4326)
+
+# Transform to UTM
+
+temp.utm2 <- st_transform(temp.utm1, crs = 32615)
+
+# Extract UTM x and y as numeric columns
+
+utm_coords <- st_coordinates(temp.utm2)
+coy.df$x <- utm_coords[, "X"]
+coy.df$y <- utm_coords[, "Y"]
+
+coy.dat <- coy.df
+```
+
+## Creation of Functions to be used in For Loop
+
+```{r}
+# Silhouette method for determining number of clusters in k-means clustering
+avg_sil <- function(k) {
+  km.res <- kmeans(input, centers = k, nstart = 25)
+  ss <- silhouette(km.res$cluster, dist(input))
+  mean(ss[, 3])
+}
+
+transform.clust <- function(key, old.ids){
+  key.df <- key[,c("old.clust.id", "new.id")]
+  key.df <- key.df[duplicated(key.df)==F,]
+  new.ids <- old.ids
+  for(j in 1:nrow(key.df)){
+    new.ids[old.ids==key.df$old.clust.id[j]] <- key.df$new.id[j]
+  }
+  return(new.ids)
+}
+
+```
+
+## Final Formatting/Prep
+
+```{r}
+
+# Convert movement data to adehabitatLT ltraj object
+
+traj <- as.ltraj(coy.dat[,c("x", "y")], date = coy.dat$rdate.cent, id = coy.dat$year.ID)
+
+head(traj)
+
+# Create empty df for output data
+full.out <- NULL 
+
+# Mini/Max number of clusters to optimize from in kmeans clustering
+
+k.values <- 2:5
+```
+
+## K-means For Loop
+
+```{r}
+for(i in 1:length(traj)){
+
+  print(i)
+  
+  # to be safe, null out udoi at the start of each loop
+  udoi <- NULL
+  
+  # Name based on ID for naming files/maps
+  temp.name <- attr(traj[[i]], "id")
+  
+  #### k-means clustering of (x,y) locations ####
+  
+  coy1_utm <- traj[[i]][,c("x", "y")]
+  input <- data.frame(x = coordinates(coy1_utm)[,1], y = coordinates(coy1_utm)[,2])
+
+  
+  ### Determining number of clusters to evaluate ###
+  avg_sil_values <- map_dbl(k.values, avg_sil)
+  
+  #K values = numbner of klusters, avg_sil is function 
+  
+  # extract optimal number of clusters
+  snc <- data.frame(k.values = k.values,
+                    sil = avg_sil_values)
+  nc <- snc$k.values[snc$sil==max(snc$sil)] #### number of clusts OUT
+  
+  
+  # add date to coy1_utm
+  coy1_utm$date <- traj[[i]][,c("date")]
+  
+  ### run kmeans clustering ###
+  out <- kmeans(input, centers=nc, nstart = 25) #### RUNS K mneas with # clust
+
+  input$cluster <- as.factor(out$cluster)
+  centers <- data.frame(x=out$centers[,c("x")], y =out$centers[,c("y")], cluster = row.names(out$centers))
+  
+  
+  input$time <- coy1_utm$date
+  
+  #### extract sequence of use of clusters ####
+  use.seq <- input
+  use.seq$cdiff <- c(NA, diff(use.seq$cluster)) # any non-zero is a cluster-use "switch"
+  
+  
+  # get time intervals based on when switching occurs
+  switches <- c(1, which(use.seq$cdiff != 0), nrow(use.seq)) 
+  seq.out <- NULL
+  
+  for(j in 1:(length(switches)-1)){
+    
+    start <- use.seq$time[switches[j]]
+    end <- use.seq$time[switches[j+1]-1]
+    
+    if(j==(length(switches)-1)){
+      end <- tail(use.seq$time,1)
+    }
+    
+    # Time of cluster use
+    
+    temp.int <- interval(start, end, tz  = "America/Chicago")
+    temp.c <- use.seq$cluster[switches[j]]
+    
+    temp.seq.out <- data.frame(interval = temp.int,
+                               old.clust.id = temp.c) ####out put##############
+    
+    seq.out <- rbind(seq.out, temp.seq.out)
+  }
+  
+  
+  # Re-name clusters based on sequence of use
+  seq.out$new.id <- NA
+  seq.out$new.id[1] <- 1 # first cluster is always "1"
+  
+  for(j in 2:nrow(seq.out)){
+      temp.old <- seq.out$old.clust.id[j]
+      
+      if(duplicated(seq.out$old.clust.id)[j]==F){
+         temp.new <- max(na.omit(seq.out$new.id)) + 1
+      }else{
+        temp.new <- unique(na.omit(seq.out$new.id[seq.out$old.clust.id==temp.old],1))
+      }
+      
+      seq.out$new.id[j] <- temp.new
+  }
+  
+  # Use the new id's in seq.out to update cluster id in "input" and "centers" dataframes
+  input$new.id <- transform.clust(key = seq.out, old.ids = input$cluster)
+  centers$new.id <- transform.clust(key = seq.out, old.ids = centers$cluster)
+  
+  input$cluster <- as.factor(input$new.id)
+
+  centers$cluster <- as.factor(centers$new.id)
+  centers <- centers[order(centers$cluster),]
+  rownames(centers) <- seq(1, nrow(centers))
+  
+  
+  # Assemble exportable results for sequence of clusters, duration of use
+  seq.vec <- paste(seq.out$new.id, collapse = "-")
+  dur.vec <- as.numeric(as.duration(seq.out$interval), "days")
+  dur.vec <- paste(dur.vec, collapse = "-")
+  
+  
+  #### total duration of use for each cluster ####
+  seq.out$dur.days <- as.numeric(as.duration(seq.out$interval), "days")
+  
+  total.dur <- data.frame(matrix(nrow = 5, ncol = 2))
+  colnames(total.dur) <- c("cluster.id", "total.dur.days")
+  total.dur$cluster.id <- seq(1, 5)
+  
+  
+  for(j in 1:nc){
+    temp.dur <- sum(seq.out$dur.days[seq.out$new.id==j])
+    total.dur$total.dur.days[j] <- temp.dur
+    
+  }
+  
+  
+  #### estimate home range vertices for identified clusters ####
+  
+  # make sure at least 30 locations for clusters used to estimate HRs
+  c.v <- NULL
+  hr.input <- input
+  coverage <- ddply(hr.input, .(cluster), function(x) nrow(x))
+  hr.input <- hr.input[hr.input$cluster %in% coverage$cluster[coverage$V1>=30],]
+  
+  c.ud <- NULL
+  c.loc <- data.frame(x = hr.input$x, y = hr.input$y)
+  c.sp <- SpatialPointsDataFrame(c.loc, data.frame(id = droplevels(as.factor(hr.input$cluster))))
+  c.ud <- kernelUD(c.sp, h = "href", grid = 200)
+  
+  try(c.v <- getverticeshr(c.ud, percent = 95, unin = "m", unout = "km2"), silent = T)
+
+    # sometimes the kernel isn't well estimated with defaults; if so, can try increasing the extent or dropping a cluster with minimal coverage (i.e. very few points)
+  
+  if(is.null(c.v)){
+    repeat{
+      # first, try increasing extent
+      c.ud <- kernelUD(c.sp, h = "href", extent = 2)
+      try(c.v <- getverticeshr(c.ud, percent = 95, unin = "m", unout = "km2"), silent = T)
+      
+      # if that doesn't work, remove a cluster
+      if(is.null(c.v)){
+        coverage2 <- coverage
+        coverage2 <- coverage2[coverage2$V1!=min(coverage2$V1),]
+        hr.input <- hr.input[hr.input$cluster %in% coverage2$cluster,]
+        c.ud <- NULL
+        c.loc <- data.frame(x = hr.input$x, y = hr.input$y)
+        c.sp <- SpatialPointsDataFrame(c.loc, data.frame(id = droplevels(as.factor(hr.input$cluster))))
+        c.ud <- kernelUD(c.sp, h = "href")
+        try(c.v <- getverticeshr(c.ud, percent = 95, unin = "m", unout = "km2"), silent = T)
+      }
+      # if that still doesn't work, repeat and try again
+      if(is.null(c.v)==F | nrow(coverage2)==0){
+        break
+      }
+    }
+  }
+
+  
+  ### plot home ranges with original points ###
+  c.d <- suppressMessages(fortify(c.v))
+
+  #### plot clusters with centroids, use by time ####
+
+  p1 <- ggplot() + geom_point(data = input, aes(x=x, y=y, color=cluster)) + geom_path(data = input, aes(x=x, y=y), alpha = 0.2)+
+    geom_point(data = centers, size=10, pch=21,color="black", aes(x=x, y=y, fill = cluster)) +
+    scale_color_manual(values = c("#377eb8", "#4daf4a", "#984ea3", "#e41a1c", "#ff7f00")) + 
+    scale_fill_manual(values = c("#377eb8", "#4daf4a", "#984ea3", "#e41a1c", "#ff7f00")) +
+    geom_polygon(data = c.d, aes(x = long, y = lat, group = group, linetype = id), colour = "black", fill = NA) +
+    ggtitle(temp.name) +
+    theme(legend.position = "none") + theme_bw()
+  
+  
+  # plot cluster use by time
+  p2 <- ggplot(data = input, aes(x=time, color = cluster, fill = cluster)) + geom_density(alpha=0.3) +
+    scale_fill_manual(values = c("#377eb8", "#4daf4a", "#984ea3", "#e41a1c", "#ff7f00")) +
+    scale_color_manual(values = c("#377eb8", "#4daf4a", "#984ea3", "#e41a1c", "#ff7f00")) +
+    ggtitle(temp.name) +
+    theme_bw()
+  
+  p <- ggarrange(p1, p2, nrow = 1)
+
+
+
+  #### home range/cluster overlap ####
+  o.df <- p.df <- matrix(nrow = 5, ncol = 5)
+  rownames(p.df) <- colnames(p.df) <- rownames(o.df) <- colnames(o.df) <- seq(1, nrow(p.df))
+  
+  udoi <- suppressWarnings(kerneloverlap(c.sp, method = "UDOI", percent = 95, grid = 200))
+
+  # if cluster(s) don't produce HR, test if those points are within other HR vertices
+  
+  no.hr.out <- NULL
+  
+  if(ncol(udoi)!=nc){
+
+    # indentfying which clusters do not have a enough points
+    no.hr <- centers$new.id[!centers$new.id %in% hr.input$new.id]
+    
+    # loop through clusters without enough points, looping through existing home ranges
+    for(k in 1:length(no.hr)){
+      
+      temp.nohr <- no.hr[k]
+      temp.nohr.dat <- input[input$new.id==temp.nohr,]
+      
+      for(j in 1:length(unique(c.d$id))){
+        temp.bound <- owin(poly = data.frame(x = rev(c.d$long[c.d$id==unique(c.d$id)[j]]), y = rev(c.d$lat[c.d$id==unique(c.d$id)[j]])))
+        isin1 <- inside.owin(x = temp.nohr.dat$x, y = temp.nohr.dat$y, w = temp.bound)
+        
+        temp.out <- data.frame(hr.id = unique(c.d$id)[j],
+                               nohr.id = temp.nohr,
+                               isin = sum(isin1),
+                               total.points = nrow(temp.nohr.dat))
+        
+        no.hr.out <- rbind(no.hr.out, temp.out)
+      }
+    }
+  }
+  
+  # extract overlap results for later output
+  for(j in 1:nrow(udoi)){
+    for(k in 1:ncol(udoi)){
+      ind1 <- rownames(udoi)[j]
+      ind2 <- colnames(udoi)[k]
+      o.df[ind1, ind2] <- udoi[j,k]
+      
+    }
+  }
+  
+  # extract overlap results for cases where the points cannot produce a HR
+  if(is.null(no.hr.out)==F){
+    for(j in 1:nrow(p.df)){
+      for(k in 1:ncol(p.df)){
+        
+        if(rownames(p.df)[j] %in% no.hr.out$hr.id & colnames(p.df)[k] %in% no.hr.out$nohr.id){
+          temp <- no.hr.out[no.hr.out$hr.id==rownames(p.df)[j] & no.hr.out$nohr.id==colnames(p.df)[k],]
+          p.df[j,k] <- p.df[k,j] <- temp$isin/temp$total.points
+        }
+        
+        if(j==k & colnames(p.df)[k] %in% no.hr.out$nohr.id){
+          p.df[j,k] <- 1 # assign overlap with self of 1 for screening for ranges with no overlap later
+        }
+        
+      }
+    }
+  }
+  
+  #### estimate distance(s) between cluster centers ####
+  d.df <- matrix(nrow = 5, ncol = 5)
+  
+  dist.centers <- as.matrix(dist(centers[,c("x", "y")], method = "euclidean")/1000)
+
+  # extract distance results for output
+  for(j in 1:nrow(dist.centers)){
+    for(k in 1:ncol(dist.centers)){
+      
+      d.df[j,k] <- dist.centers[j,k]
+      
+    }
+  }
+  
+  
+  #### check if output matrices are all symmetrical ####
+  if(any(c(isSymmetric(d.df), isSymmetric(o.df), isSymmetric(p.df))==F)){
+    stop("assymetric matrices!")
+  }
+  
+  #### ASSEMBLE OUTPUT ####
+  temp.full.out <- data.frame(id = burst(traj[i]),
+                              nc = paste(nc),
+                              
+                              # location of centers
+                              c1.x = centers$x[1],
+                              c1.y = centers$y[1],
+                              c2.x = centers$x[2],
+                              c2.y = centers$y[2],
+                              c3.x = centers$x[3],
+                              c3.y = centers$y[3],
+                              c4.x = centers$x[4],
+                              c4.y = centers$y[4],
+                              c5.x = centers$x[5],
+                              c5.y = centers$y[5],
+                              
+                              # distances between centers
+                              dc.km.1_2 = d.df[1,2],
+                              dc.km.1_3 = d.df[1,3],
+                              dc.km.1_4 = d.df[1,4],
+                              dc.km.1_5 = d.df[1,5],
+                              dc.km.2_3 = d.df[2,3],
+                              dc.km.2_4 = d.df[2,4],
+                              dc.km.2_5 = d.df[2,5],
+                              dc.km.3_4 = d.df[3,4],
+                              dc.km.3_5 = d.df[3,5],
+                              dc.km.4_5 = d.df[4,5],
+                              
+                              # overlap between home ranges
+                              o.1_2 = o.df[1,2],
+                              o.1_3 = o.df[1,3],
+                              o.1_4 = o.df[1,4],
+                              o.1_5 = o.df[1,5],
+                              o.2_3 = o.df[2,3],
+                              o.2_4 = o.df[2,4],
+                              o.2_5 = o.df[2,5],
+                              o.3_4 = o.df[3,4],
+                              o.3_5 = o.df[3,5],
+                              o.4_5 = o.df[4,5],
+                        
+                              # overlap of points if don't have home range
+                              p.1_2 = p.df[1,2],
+                              p.1_3 = p.df[1,3],
+                              p.1_4 = p.df[1,4],
+                              p.1_5 = p.df[1,5],
+                              p.2_3 = p.df[2,3],
+                              p.2_4 = p.df[2,4],
+                              p.2_5 = p.df[2,5],
+                              p.3_4 = p.df[3,4],
+                              p.3_5 = p.df[3,5],
+                              p.4_5 = p.df[4,5],
+                              
+                              # duration of use by cluster (total use in days)
+                              dur1.td = total.dur$total.dur.days[1],
+                              dur2.td = total.dur$total.dur.days[2],
+                              dur3.td = total.dur$total.dur.days[3],
+                              dur4.td = total.dur$total.dur.days[4],
+                              dur5.td = total.dur$total.dur.days[5]
+                              
+                              )
+  
+  # add class and RSI estimate to plot, then save plot
+  p <- annotate_figure(p, top = class)
+  
+  full.out <- rbind(full.out, temp.full.out)
+  
+  
+ #Maps as jpeg for visualization
+  ggsave(paste0(temp.name,".jpeg"), p1, path = "Maps", width = 16, height = 8, units = "in", dpi = 300) 
+  ggsave(paste0("Combo_",temp.name,".jpeg"), p, path = "Maps", width = 16, height = 8, units = "in", dpi = 300) 
+}
+```
+
+```{r}
+# Show last plots made in For Loop to check if everything went correctly
+p
+p1
+```
+
+```{r}
+#Save data output df as RDate & csv
+
+save(full.out, file = "Full_out.RDate")
+write.csv(full.out,file = "Full_out.csv")
+
+```
+
+## Data Analysis/Exploration
+
+```{r}
+#Extracting each analysis' results into own data frame
+
+# UDOI overlap scores
+overlap <- full.out[, c("id", grep("^o", names(full.out), value = TRUE))]
+
+# Distance between centroids
+dist.center <- full.out[, c("id", grep("^dc", names(full.out), value = TRUE))]
+```
+
+```{r}
+#Add column with mean UDOI score ingoring NA
+
+overlap$score.mean <- rowMeans(overlap[, 2:10], na.rm = TRUE)
+
+#Add column with mean distance between centroids ingoring NA
+
+dist.center$dist.mean <- rowMeans(dist.center[, 2:10], na.rm = TRUE)
+
+head(overlap)
+head(dist.center)
+```
+
+```{r}
+#UDOI scores
+#Select 10 individuals with ranges BELOW 35km (from pervous wAKDE) defined as res (resident)
+
+res.sub.overlap <- overlap[overlap$id %in% c("year1.C2084gy", "year1.C2085gy", "year1.C2046oe", "year1.C2024we", "year1.C2071gn","year2.C2148be", "year1.C1835gy", "year1.C2129pk", "year2.C2106yw", "year2.C1809gy"), ]
+
+res.sub.overlap$state <- "res"
+
+#Select 10 individuals with ranges ABOVE 35km (from pervous wAKDE) defined as trans (transiant)
+
+trans.sub.overlap <- overlap[overlap$id %in% c("year1.C1047be", "year1.C1042be", "year1.C1822gy", "year1.C2001we","year2.C1833gy", "year2.C2003we", "year2.C2101yw", "year2.C1032oe", "year2.C2087gy", "year1.C2034we"), ]
+
+trans.sub.overlap$state <- "trans"
+
+sub.overlap <- rbind(res.sub.overlap, trans.sub.overlap)
+
+head(sub.overlap)
+```
+
+```{r}
+#Distance between centers 
+#Select 10 individuals with ranges BELOW 35km (from pervous wAKDE) defined as res (resident)
+
+res.sub.dist.center <- dist.center[dist.center$id %in% c("year1.C2084gy", "year1.C2085gy", "year1.C2046oe", "year1.C2024we", "year1.C2071gn","year2.C2148be", "year1.C1835gy", "year1.C2129pk", "year2.C2106yw", "year2.C1809gy"), ]
+
+res.sub.dist.center$state <- "res"
+
+#Select 10 individuals with ranges ABOVE 35km (from pervous wAKDE) defined as trans (transiant)
+
+trans.sub.dist.center <- dist.center[dist.center$id %in% c("year1.C1047be", "year1.C1042be", "year1.C1822gy", "year1.C2001we","year2.C1833gy", "year2.C2003we", "year2.C2101yw", "year2.C1032oe", "year2.C2087gy", "year1.C2034we"), ]
+
+trans.sub.dist.center$state <- "trans"
+
+sub.dist.center <- rbind(res.sub.dist.center, trans.sub.dist.center)
+
+head(sub.dist.center)
+```
+
+```{r}
+#T test between subsample res/trans mean UDOI scores
+t.overlap <- t.test(score.mean ~ state, data = sub.overlap)
+
+t.overlap
+```
+
+```{r}
+#T test between subsample res/trans mean distance between centers 
+t.dist.center <- t.test(dist.mean ~ state, data = sub.dist.center)
+
+t.dist.center
+```
+
+```{r}
+#T test between subsample res/trans mean distance between centers with outliner removed
+R.sub.dist.center <- sub.dist.center %>%
+  filter(id != "year1.C2085gy")
+
+R.t.dist.center <- t.test(dist.mean ~ state, data = R.sub.dist.center)
+
+R.t.dist.center
+```

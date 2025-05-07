@@ -8,6 +8,6 @@
 # uncomment any intall.packages you don't have
 # run each chunk
 # Code should auto set working directory and pull data from it regardless of were placed
-#ONLY TESTED ON WINDOWS!! AUTO PATH FUNCTIONS MAY NOT WORK ON MAC!!
+ONLY TESTED ON WINDOWS!! AUTO PATH FUNCTIONS MAY NOT WORK ON MAC!!
 
 # plots (Maps) will be placed in Maps folder you created 

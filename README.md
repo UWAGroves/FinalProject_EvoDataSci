@@ -1,6 +1,8 @@
 # FinalProject_EvoDataSci
 
-# Open Groves_Coy_Kmeans.html for easy viewing of R code and outputs for each chunk
+# For easy viewing of R code and outputs for each chunk
+Download and Open Groves_Coy_Kmeans.html 
+
 # Plots/Maps generated from For Loop are in the Maps folder in GitHub repository
 
 # If you wish to run the R code yourself
